@@ -130,8 +130,25 @@ jobs:
           distribution: temurin
           java-version: ${{ steps.detect.outputs.java }}
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # The runner already ships an Android SDK; just accept licences and make sure the platform exists.
+      - name: Prepare Android SDK (preinstalled on the runner)
+        env:
+          PROJECT_ROOT: ${{ steps.detect.outputs.root }}
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "Android SDK: $SDK"
+          SM="$(find "$SDK/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1 || true)"
+          echo "sdkmanager: ${SM:-not found}"
+          CSDK="$(grep -rhoE 'compileSdk(Version)?[[:space:]]*(=)?[[:space:]]*[0-9]+' --include='*.gradle' --include='*.gradle.kts' "$PROJECT_ROOT" | grep -oE '[0-9]+' | sort -n | tail -n 1 || true)"
+          echo "compileSdk: ${CSDK:-unknown}"
+          if [ -n "$SM" ]; then
+            yes | "$SM" --sdk_root="$SDK" --licenses > /dev/null 2>&1 || true
+            if [ -n "$CSDK" ]; then
+              "$SM" --sdk_root="$SDK" "platforms;android-$CSDK" || echo "Platform install skipped; Gradle will try to download it."
+            fi
+          fi
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
 
       - name: Set up Gradle (project wrapper)
         if: steps.detect.outputs.has_wrapper == 'true'
