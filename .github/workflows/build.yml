@@ -1,0 +1,189 @@
+name: Build Melo APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIP_NAME: Melo_Final_Stable_Source-1.zip
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Extract ZIP
+        run: |
+          set -euo pipefail
+          ZIP="$(find . -maxdepth 2 -type f -name "$ZIP_NAME" -not -path './.git/*' | head -n 1)"
+          if [ -z "$ZIP" ]; then
+            echo "::error::$ZIP_NAME was not found in the repository. Files present:"
+            ls -la
+            exit 1
+          fi
+          echo "Found: $ZIP"
+          unzip -l "$ZIP" | tail -n 5
+          mkdir -p "$RUNNER_TEMP/melo-src"
+          unzip -q -o "$ZIP" -x '__MACOSX/*' '*/.DS_Store' -d "$RUNNER_TEMP/melo-src"
+          echo "Extracted to $RUNNER_TEMP/melo-src"
+          echo "MELO_SRC=$RUNNER_TEMP/melo-src" >> "$GITHUB_ENV"
+
+      - name: Detect project root and build requirements
+        id: detect
+        run: |
+          set -euo pipefail
+          SRC="$MELO_SRC"
+
+          # Project root = shallowest folder containing settings.gradle(.kts)
+          SETTINGS="$(find "$SRC" -type f \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -not -path '*/build/*' -not -path '*/node_modules/*' -not -path '*/.gradle/*' \
+            | awk '{ print gsub("/","/") " " $0 }' | sort -n | head -n 1 | cut -d' ' -f2-)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::No settings.gradle / settings.gradle.kts found in the ZIP, so it is not a buildable Gradle Android project. ZIP contents:"
+            find "$SRC" -maxdepth 3 | head -n 100
+            exit 1
+          fi
+          ROOT="$(dirname "$SETTINGS")"
+          echo "Project root: $ROOT"
+          cd "$ROOT"
+
+          echo "--- Top-level files"; ls -la
+          echo "--- Gradle / manifest files"
+          find . -type f \( -name '*.gradle' -o -name '*.gradle.kts' -o -name 'libs.versions.toml' \
+            -o -name 'gradle-wrapper.properties' -o -name 'AndroidManifest.xml' \) -not -path '*/build/*'
+
+          # Project type
+          if grep -rqE 'com\.android\.(application|library)' --include='*.gradle' --include='*.gradle.kts' --include='*.toml' .; then
+            echo "Android Gradle project detected"
+          else
+            echo "::error::Gradle project found but no Android Gradle Plugin is applied; not an Android app."
+            exit 1
+          fi
+
+          # Wrapper?
+          HAS_WRAPPER=false
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.properties ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            HAS_WRAPPER=true
+          fi
+
+          # Android Gradle Plugin version
+          AGP="$(grep -rhoE 'com\.android\.(application|library)"?\)?[^0-9"]*(version)?[^0-9]*"?[0-9]+\.[0-9]+(\.[0-9]+)?' \
+                   --include='*.gradle' --include='*.gradle.kts' . | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || true)"
+          if [ -z "$AGP" ]; then
+            AGP="$(grep -rhoE 'com\.android\.tools\.build:gradle:[0-9]+\.[0-9]+(\.[0-9]+)?' --include='*.gradle' --include='*.gradle.kts' . \
+                   | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?$' | head -n 1 || true)"
+          fi
+          if [ -z "$AGP" ]; then
+            AGP="$(grep -hE '^\s*(agp|androidGradlePlugin)\s*=' $(find . -name libs.versions.toml) 2>/dev/null \
+                   | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || true)"
+          fi
+          echo "AGP version: ${AGP:-unknown}"
+          AGP_MAJOR="${AGP%%.*}"; AGP_MINOR="$(echo "$AGP" | cut -d. -f2)"
+
+          # Java version required by that AGP
+          if [ -z "$AGP" ]; then JAVA=17
+          elif [ "$AGP_MAJOR" -ge 8 ]; then JAVA=17
+          elif [ "$AGP_MAJOR" -eq 7 ]; then JAVA=11
+          else JAVA=8; fi
+          # Never go below the Java level the project itself targets
+          if grep -rqE 'VERSION_21|jvmTarget\s*=\s*"21"|JavaVersion\.toVersion\(21\)' --include='*.gradle' --include='*.gradle.kts' .; then JAVA=21; fi
+
+          # Gradle version
+          GRADLE=""
+          if [ "$HAS_WRAPPER" = true ]; then
+            GRADLE="$(grep -oE 'gradle-[0-9.]+(-rc-[0-9]+)?-(bin|all)' gradle/wrapper/gradle-wrapper.properties | sed -E 's/^gradle-//; s/-(bin|all)$//' || true)"
+            echo "Using project Gradle wrapper (Gradle $GRADLE)"
+          else
+            echo "No Gradle wrapper in project; choosing Gradle from the AGP version (minimum Gradle per AGP release notes)"
+            if [ "$AGP_MAJOR" -ge 9 ]; then GRADLE=9.1.0
+            elif [ "$AGP_MAJOR" -eq 8 ]; then
+              case "$AGP_MINOR" in
+                0) GRADLE=8.0.2;; 1) GRADLE=8.2;; 2) GRADLE=8.2;; 3) GRADLE=8.4;; 4) GRADLE=8.6;;
+                5) GRADLE=8.7;; 6) GRADLE=8.7;; 7) GRADLE=8.9;; 8) GRADLE=8.10.2;; 9|10) GRADLE=8.11.1;;
+                *) GRADLE=8.13;;
+              esac
+            elif [ "$AGP_MAJOR" -eq 7 ]; then
+              case "$AGP_MINOR" in 0) GRADLE=7.0.2;; 1) GRADLE=7.2;; 2) GRADLE=7.3.3;; 3) GRADLE=7.4;; *) GRADLE=7.5;; esac
+            else GRADLE=6.9.4; fi
+          fi
+          echo "Gradle: $GRADLE"
+          echo "Java:   $JAVA"
+          grep -rhE 'compileSdk|targetSdk|minSdk' --include='*.gradle' --include='*.gradle.kts' . || true
+
+          {
+            echo "root=$ROOT"
+            echo "has_wrapper=$HAS_WRAPPER"
+            echo "java=$JAVA"
+            echo "gradle=$GRADLE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK ${{ steps.detect.outputs.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.detect.outputs.java }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle (project wrapper)
+        if: steps.detect.outputs.has_wrapper == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up Gradle (installed, no wrapper in project)
+        if: steps.detect.outputs.has_wrapper != 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.detect.outputs.gradle }}
+
+      - name: Build debug APK
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.detect.outputs.has_wrapper }}" = "true" ]; then
+            chmod +x ./gradlew; G=./gradlew
+          else
+            G=gradle
+          fi
+          $G --version
+          $G --no-daemon --stacktrace assembleDebug
+
+      # Release is built as a bonus; a failure here (for example an R8 shrinker issue)
+      # does not stop the debug APK from being delivered.
+      - name: Build release APK (optional)
+        id: release
+        continue-on-error: true
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.detect.outputs.has_wrapper }}" = "true" ]; then G=./gradlew; else G=gradle; fi
+          $G --no-daemon --stacktrace assembleRelease
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Melo-debug-APK
+          path: ${{ steps.detect.outputs.root }}/**/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload release APK
+        if: steps.release.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Melo-release-APK
+          path: ${{ steps.detect.outputs.root }}/**/build/outputs/apk/release/*.apk
+          if-no-files-found: warn
+
+      - name: Upload build reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Melo-build-reports
+          path: |
+            ${{ steps.detect.outputs.root }}/**/build/reports/**
+          if-no-files-found: ignore
