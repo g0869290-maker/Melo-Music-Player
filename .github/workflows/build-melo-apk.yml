@@ -1,0 +1,174 @@
+
+name: Build Melo APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+env:
+  ZIP_NAME: Melo_Final_Stable_Source-1.zip
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Extract ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP="$(find . -maxdepth 2 -type f -name "$ZIP_NAME" \
+            -not -path './.git/*' | head -n 1)"
+
+          if [ -z "$ZIP" ]; then
+            echo "::error::$ZIP_NAME not found in repository."
+            ls -la
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/melo-src"
+          unzip -q -o "$ZIP" \
+            -x '__MACOSX/*' '*/.DS_Store' \
+            -d "$RUNNER_TEMP/melo-src"
+
+          echo "MELO_SRC=$RUNNER_TEMP/melo-src" >> "$GITHUB_ENV"
+
+      - name: Detect Android project
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SETTINGS="$(find "$MELO_SRC" -type f \
+            \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -not -path '*/build/*' \
+            -not -path '*/node_modules/*' \
+            -not -path '*/.gradle/*' \
+            | awk '{ print gsub("/","/") " " $0 }' \
+            | sort -n | head -n 1 | cut -d' ' -f2-)"
+
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::No Gradle Android project found."
+            find "$MELO_SRC" -maxdepth 4 -type f | head -n 100
+            exit 1
+          fi
+
+          ROOT="$(dirname "$SETTINGS")"
+          cd "$ROOT"
+
+          if ! grep -rqE \
+            'com\.android\.(application|library)' \
+            --include='*.gradle' \
+            --include='*.gradle.kts' \
+            --include='*.toml' .; then
+            echo "::error::Android Gradle Plugin not found."
+            exit 1
+          fi
+
+          if [ ! -f gradlew ] || \
+             [ ! -f gradle/wrapper/gradle-wrapper.properties ] || \
+             [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "::error::Gradle wrapper is incomplete."
+            exit 1
+          fi
+
+          JAVA=17
+
+          if grep -rqE \
+            'VERSION_21|jvmTarget\s*=\s*"21"|JavaVersion\.toVersion\(21\)' \
+            --include='*.gradle' --include='*.gradle.kts' .; then
+            JAVA=21
+          fi
+
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "java=$JAVA" >> "$GITHUB_OUTPUT"
+
+          echo "Project root: $ROOT"
+          echo "Java version: $JAVA"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.detect.outputs.java }}
+
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+
+          echo "Android SDK: $SDK"
+
+          if [ ! -d "$SDK" ]; then
+            echo "::error::Android SDK not found."
+            exit 1
+          fi
+
+          SM="$(find "$SDK/cmdline-tools" -name sdkmanager \
+            -type f 2>/dev/null | head -n 1 || true)"
+
+          if [ -n "$SM" ]; then
+            yes | "$SM" --sdk_root="$SDK" --licenses \
+              >/dev/null 2>&1 || true
+          fi
+
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Debug APK
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Melo-debug-APK
+          path: ${{ steps.detect.outputs.root }}/**/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Build Release APK
+        id: release
+        continue-on-error: true
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: Upload Release APK
+        if: steps.release.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Melo-release-APK
+          path: ${{ steps.detect.outputs.root }}/**/build/outputs/apk/release/*.apk
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload Build Reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Melo-build-reports
+          path: |
+            **/build/reports/**
+            **/build/outputs/logs/**
+          if-no-files-found: ignore
+          retention-days: 7
