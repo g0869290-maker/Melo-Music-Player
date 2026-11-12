@@ -82,149 +82,82 @@ jobs:
           from pathlib import Path
 
           root = Path(os.environ["PROJECT_ROOT"])
-
-          patterns = [
-              re.compile(r'com\.android\.tools\.build:gradle:([0-9]+\.[0-9]+(?:\.[0-9]+)?)'),
-              re.compile(r'''id\s*['"]com\.android\.(?:application|library)['"]\s*version\s*['"]([0-9]+\.[0-9]+(?:\.[0-9]+)?)'''),
-              re.compile(r'''^\s*agp\s*=\s*['"]([0-9]+\.[0-9]+(?:\.[0-9]+)?)['"]''', re.M),
-          ]
-
-          files = []
-          for pattern in ("*.gradle", "*.gradle.kts", "*.toml"):
-              files.extend(root.rglob(pattern))
-
-          files = [
-              p for p in files
-              if not any(part in {".gradle", "build", "node_modules"} for part in p.parts)
+          candidates = [
+              root / "build.gradle",
+              root / "build.gradle.kts",
+              *root.glob("**/build.gradle"),
+              *root.glob("**/build.gradle.kts"),
           ]
 
           agp = None
-          for file in files:
-              try:
-                  content = file.read_text(errors="ignore")
-              except Exception:
+          for path in candidates:
+              if not path.is_file():
                   continue
-
-              for pattern in patterns:
-                  match = pattern.search(content)
-                  if match:
-                      agp = match.group(1)
-                      break
-
-              if agp:
+              text = path.read_text(errors="ignore")
+              match = re.search(
+                  r"(?:com\.android\.(?:application|library)|com\.android\.tools\.build:gradle)[^\n]*?['\"](\d+\.\d+(?:\.\d+)?)",
+                  text
+              )
+              if match:
+                  agp = match.group(1)
                   break
 
-          major_minor = ".".join(agp.split(".")[:2]) if agp else "8.7"
-
-          gradle_versions = {
-              "9.0": "9.1.0",
-              "8.13": "8.13",
-              "8.12": "8.13",
-              "8.11": "8.13",
-              "8.10": "8.11.1",
-              "8.9": "8.11.1",
-              "8.8": "8.10.2",
-              "8.7": "8.9",
-              "8.6": "8.7",
-              "8.5": "8.7",
-              "8.4": "8.6",
-              "8.3": "8.4",
-              "8.2": "8.2.1",
-              "8.1": "8.0.2",
-              "8.0": "8.0.2",
-              "7.4": "7.5",
-              "7.3": "7.4",
-              "7.2": "7.3.3",
-              "7.1": "7.2",
-              "7.0": "7.0.2",
-          }
-
-          gradle = gradle_versions.get(major_minor, "8.9")
-
-          java = "17"
-          if major_minor.startswith(("7.", "6.")):
-              java = "11"
-
-          print(f"Detected AGP: {agp or 'unknown'}")
-          print(f"Selected Gradle: {gradle}")
-          print(f"Selected Java: {java}")
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"agp={agp or 'unknown'}\n")
-              output.write(f"gradle_version={gradle}\n")
-              output.write(f"java_version={java}\n")
+          if agp:
+              print(f"Detected Android Gradle Plugin: {agp}")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  output.write(f"agp={agp}\n")
+          else:
+              print("Android Gradle Plugin version not detected.")
           PY
 
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ steps.detect.outputs.java_version }}
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: ${{ steps.detect.outputs.gradle_version }}
+          java-version: "17"
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-
-      - name: Verify Android SDK tools
-        shell: bash
-        run: |
-          echo "Android SDK: $ANDROID_HOME"
-          command -v sdkmanager
-          sdkmanager --version
-
-      - name: Accept Android SDK licenses
-        shell: bash
-        run: |
-          yes | sdkmanager --licenses || true
-
-      - name: Install Android SDK packages
-        shell: bash
-        run: |
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
+        uses: android-actions/setup-android@v3
 
       - name: Build debug APK
         shell: bash
-        working-directory: ${{ steps.detect.outputs.root }}
         run: |
           set -e
+          cd "${{ steps.detect.outputs.root }}"
+
           if [ "${{ steps.detect.outputs.wrapper }}" = "true" ]; then
             ./gradlew --no-daemon --stacktrace assembleDebug
           else
-            gradle --no-daemon --stacktrace assembleDebug
+            echo "::error::Gradle wrapper is missing. Include gradlew and gradle/wrapper files in the source ZIP."
+            exit 1
           fi
-
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Melo-Debug-APK
-          path: ${{ steps.detect.outputs.root }}/**/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
-          retention-days: 14
 
       - name: Build release APK
-        if: ${{ inputs.build_release == true }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_release }}
         shell: bash
-        working-directory: ${{ steps.detect.outputs.root }}
         run: |
           set -e
-          if [ "${{ steps.detect.outputs.wrapper }}" = "true" ]; then
-            ./gradlew --no-daemon --stacktrace assembleRelease
-          else
-            gradle --no-daemon --stacktrace assembleRelease
+          cd "${{ steps.detect.outputs.root }}"
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: Collect APK files
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/apk-output"
+
+          find "$SOURCE_DIR" -type f -name "*.apk" \
+            -exec cp -v {} "$GITHUB_WORKSPACE/apk-output/" \; || true
+
+          if [ -z "$(find "$GITHUB_WORKSPACE/apk-output" -name "*.apk" -print -quit)" ]; then
+            echo "No APK files were generated."
           fi
 
-      - name: Upload release APK
-        if: ${{ inputs.build_release == true }}
+      - name: Upload APK artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Melo-Release-APK
-          path: ${{ steps.detect.outputs.root }}/**/build/outputs/apk/release/*.apk
-          if-no-files-found: error
+          name: Melo-APK
+          path: apk-output/*.apk
+          if-no-files-found: warn
           retention-days: 14
